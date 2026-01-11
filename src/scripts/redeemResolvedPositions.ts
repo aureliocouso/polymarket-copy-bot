@@ -1,3 +1,4 @@
+import Safe, { EthersAdapter } from '@safe-global/protocol-kit';
 import { ethers } from 'ethers';
 import { ENV } from '../config/env';
 import fetchData from '../utils/fetchData';
@@ -5,10 +6,10 @@ import fetchData from '../utils/fetchData';
 const PROXY_WALLET = ENV.PROXY_WALLET;
 const PRIVATE_KEY = ENV.PRIVATE_KEY;
 const RPC_URL = ENV.RPC_URL || 'https://polygon-rpc.com';
+const USDC_ADDRESS = ENV.USDC_CONTRACT_ADDRESS;
 
 // Contract addresses on Polygon
 const CTF_CONTRACT_ADDRESS = '0x4D97DCd97eC945f40cF65F87097ACe5EA0476045';
-const USDC_ADDRESS = '0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174'; // USDC on Polygon
 
 // Thresholds for considering a position "resolved"
 const RESOLVED_HIGH = 0.99; // Position won (price ~$1)
@@ -34,6 +35,8 @@ const CTF_ABI = [
     'function balanceOf(address owner, uint256 tokenId) external view returns (uint256)',
 ];
 
+const ERC20_ABI = ['function balanceOf(address owner) external view returns (uint256)'];
+
 const loadPositions = async (address: string): Promise<Position[]> => {
     const url = `https://data-api.polymarket.com/positions?user=${address}`;
     const data = await fetchData(url);
@@ -41,19 +44,91 @@ const loadPositions = async (address: string): Promise<Position[]> => {
     return positions.filter((pos) => (pos.size || 0) > ZERO_THRESHOLD);
 };
 
+const normalizeConditionId = (conditionId: string): string => {
+    if (/^0x[0-9a-fA-F]{64}$/.test(conditionId)) {
+        return conditionId;
+    }
+
+    if (/^\d+$/.test(conditionId)) {
+        return ethers.utils.hexZeroPad(
+            ethers.BigNumber.from(conditionId).toHexString(),
+            32
+        );
+    }
+
+    throw new Error(`Invalid conditionId format: ${conditionId}`);
+};
+
+const redeemViaSafeV1 = async ({
+    provider,
+    ownerSigner,
+    safeAddress,
+    ctfAddress,
+    collateral,
+    conditionIdBytes32,
+    indexSets,
+}: {
+    provider: ethers.providers.Provider;
+    ownerSigner: ethers.Signer;
+    safeAddress: string;
+    ctfAddress: string;
+    collateral: string;
+    conditionIdBytes32: string;
+    indexSets: number[];
+}): Promise<ethers.providers.TransactionResponse> => {
+    const ethAdapter = new EthersAdapter({
+        ethers,
+        signerOrProvider: ownerSigner,
+    });
+    const safeSdk = await Safe.create({ ethAdapter, safeAddress });
+    const signerAddress = await ownerSigner.getAddress();
+    const owners = (await safeSdk.getOwners()).map((owner) => owner.toLowerCase());
+
+    if (!owners.includes(signerAddress.toLowerCase())) {
+        throw new Error('Wrong PRIVATE_KEY: signer is not an owner of the Safe');
+    }
+
+    const threshold = await safeSdk.getThreshold();
+    if (threshold !== 1) {
+        throw new Error('Safe threshold != 1; this automation assumes 1-of-1 Safe');
+    }
+
+    const ctfInterface = new ethers.utils.Interface(CTF_ABI);
+    const data = ctfInterface.encodeFunctionData('redeemPositions', [
+        collateral,
+        ethers.constants.HashZero,
+        conditionIdBytes32,
+        indexSets,
+    ]);
+
+    const safeTx = await safeSdk.createTransaction({
+        safeTransactionData: {
+            to: ctfAddress,
+            value: '0',
+            data,
+        },
+    });
+
+    const exec = await safeSdk.executeTransaction(safeTx);
+    const tx = exec.transactionResponse;
+    await tx.wait();
+
+    const sent = await provider.getTransaction(tx.hash);
+    if (sent?.to?.toLowerCase() !== safeAddress.toLowerCase()) {
+        throw new Error("BUG: not a Safe execTransaction tx (wrong 'to')");
+    }
+
+    return tx;
+};
+
 const redeemPosition = async (
-    ctfContract: ethers.Contract,
+    provider: ethers.providers.Provider,
+    ownerSigner: ethers.Signer,
     position: Position
 ): Promise<{ success: boolean; error?: string }> => {
     try {
         // Convert conditionId to bytes32 format
-        const conditionIdBytes32 = ethers.utils.hexZeroPad(
-            ethers.BigNumber.from(position.conditionId).toHexString(),
-            32
-        );
-
-        // parentCollectionId is always zero for Polymarket
-        const parentCollectionId = ethers.constants.HashZero;
+        const conditionIdBytes32 = normalizeConditionId(position.conditionId);
 
         // indexSets: [1, 2] represents both outcome collections
         // We use [1, 2] to redeem all positions for this condition
@@ -63,42 +138,34 @@ const redeemPosition = async (
         console.log(`   Condition ID: ${conditionIdBytes32}`);
         console.log(`   Index Sets: [${indexSets.join(', ')}]`);
 
-        // Get current gas price from network
-        const feeData = await ctfContract.provider.getFeeData();
-        const gasPrice = feeData.gasPrice || feeData.maxFeePerGas;
+        const usdcContract = new ethers.Contract(USDC_ADDRESS, ERC20_ABI, provider);
+        const balanceBefore = await usdcContract.balanceOf(PROXY_WALLET);
 
-        if (!gasPrice) {
-            throw new Error('Could not determine gas price');
-        }
-
-        // Add 20% buffer to ensure transaction goes through
-        const adjustedGasPrice = gasPrice.mul(120).div(100);
-
-        console.log(`   Gas price: ${ethers.utils.formatUnits(adjustedGasPrice, 'gwei')} Gwei`);
-
-        const tx = await ctfContract.redeemPositions(
-            USDC_ADDRESS,
-            parentCollectionId,
+        const tx = await redeemViaSafeV1({
+            provider,
+            ownerSigner,
+            safeAddress: PROXY_WALLET,
+            ctfAddress: CTF_CONTRACT_ADDRESS,
+            collateral: USDC_ADDRESS,
             conditionIdBytes32,
             indexSets,
-            {
-                gasLimit: 500000, // Set a reasonable gas limit
-                gasPrice: adjustedGasPrice,
-            }
-        );
+        });
 
         console.log(`   ⏳ Transaction submitted: ${tx.hash}`);
-        console.log(`   ⏳ Waiting for confirmation...`);
+        console.log(`   ✅ Redemption confirmed via Safe execTransaction`);
 
-        const receipt = await tx.wait();
-
-        if (receipt.status === 1) {
-            console.log(`   ✅ Redemption successful! Gas used: ${receipt.gasUsed.toString()}`);
-            return { success: true };
-        } else {
-            console.log(`   ❌ Transaction failed`);
-            return { success: false, error: 'Transaction reverted' };
+        const balanceAfter = await usdcContract.balanceOf(PROXY_WALLET);
+        const delta = balanceAfter.sub(balanceBefore);
+        console.log(
+            `   💵 Safe USDC balance delta: ${ethers.utils.formatUnits(delta, 6)}`
+        );
+        if (delta.isZero()) {
+            console.log(
+                '   ⚠️  WARNING: USDC balance did not increase. Check if position was a winner.'
+            );
         }
+
+        return { success: true };
     } catch (error: any) {
         const errorMessage = error.message || String(error);
         console.log(`   ❌ Redemption failed: ${errorMessage}`);
@@ -138,13 +205,9 @@ const main = async () => {
     // Check if signer is proxy wallet or owner
     if (wallet.address.toLowerCase() !== PROXY_WALLET.toLowerCase()) {
         console.log(
-            `⚠️  Note: Signer (${wallet.address}) differs from proxy wallet (${PROXY_WALLET})`
+            `ℹ️  Expected: signer is EOA owner; redemption executed via Safe proxy.`
         );
-        console.log(`   Make sure signer has permission to execute transactions on proxy wallet`);
     }
-
-    // Create contract instance
-    const ctfContract = new ethers.Contract(CTF_CONTRACT_ADDRESS, CTF_ABI, wallet);
 
     // Load positions
     const allPositions = await loadPositions(PROXY_WALLET);
@@ -154,12 +217,20 @@ const main = async () => {
         return;
     }
 
+    const includeLosers = process.env.REDEEM_LOSERS === 'true';
+
     // Filter for resolved and redeemable positions
-    const redeemablePositions = allPositions.filter(
-        (pos) =>
-            (pos.curPrice >= RESOLVED_HIGH || pos.curPrice <= RESOLVED_LOW) &&
-            pos.redeemable === true
-    );
+    const redeemablePositions = allPositions.filter((pos) => {
+        if (pos.redeemable !== true) {
+            return false;
+        }
+
+        if (pos.curPrice >= RESOLVED_HIGH) {
+            return true;
+        }
+
+        return includeLosers && pos.curPrice <= RESOLVED_LOW;
+    });
 
     const activePositions = allPositions.filter(
         (pos) => pos.curPrice > RESOLVED_LOW && pos.curPrice < RESOLVED_HIGH
@@ -214,7 +285,7 @@ const main = async () => {
         });
 
         // Redeem once for this condition (redeems all positions)
-        const result = await redeemPosition(ctfContract, positions[0]);
+        const result = await redeemPosition(provider, wallet, positions[0]);
 
         if (result.success) {
             successCount++;
