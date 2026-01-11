@@ -1,4 +1,3 @@
-import Safe, { EthersAdapter } from '@safe-global/protocol-kit';
 import { ethers } from 'ethers';
 import { ENV } from '../config/env';
 import fetchData from '../utils/fetchData';
@@ -36,6 +35,12 @@ const CTF_ABI = [
 ];
 
 const ERC20_ABI = ['function balanceOf(address owner) external view returns (uint256)'];
+const SAFE_ABI = [
+    'function getOwners() public view returns (address[])',
+    'function getThreshold() public view returns (uint256)',
+    'function nonce() public view returns (uint256)',
+    'function execTransaction(address to,uint256 value,bytes data,uint8 operation,uint256 safeTxGas,uint256 baseGas,uint256 gasPrice,address gasToken,address refundReceiver,bytes signatures) public payable returns (bool success)',
+];
 
 const loadPositions = async (address: string): Promise<Position[]> => {
     const url = `https://data-api.polymarket.com/positions?user=${address}`;
@@ -76,19 +81,17 @@ const redeemViaSafeV1 = async ({
     conditionIdBytes32: string;
     indexSets: number[];
 }): Promise<ethers.providers.TransactionResponse> => {
-    const ethAdapter = new EthersAdapter({
-        ethers,
-        signerOrProvider: ownerSigner,
-    });
-    const safeSdk = await Safe.create({ ethAdapter, safeAddress });
     const signerAddress = await ownerSigner.getAddress();
-    const owners = (await safeSdk.getOwners()).map((owner) => owner.toLowerCase());
+    const safeContract = new ethers.Contract(safeAddress, SAFE_ABI, ownerSigner);
+    const owners = (await safeContract.getOwners()).map((owner: string) =>
+        owner.toLowerCase()
+    );
 
     if (!owners.includes(signerAddress.toLowerCase())) {
         throw new Error('Wrong PRIVATE_KEY: signer is not an owner of the Safe');
     }
 
-    const threshold = await safeSdk.getThreshold();
+    const threshold = await safeContract.getThreshold();
     if (threshold !== 1) {
         throw new Error('Safe threshold != 1; this automation assumes 1-of-1 Safe');
     }
@@ -101,16 +104,54 @@ const redeemViaSafeV1 = async ({
         indexSets,
     ]);
 
-    const safeTx = await safeSdk.createTransaction({
-        safeTransactionData: {
-            to: ctfAddress,
-            value: '0',
-            data,
-        },
-    });
+    const nonce = await safeContract.nonce();
+    const { chainId } = await provider.getNetwork();
 
-    const exec = await safeSdk.executeTransaction(safeTx);
-    const tx = exec.transactionResponse;
+    const safeTx = {
+        to: ctfAddress,
+        value: 0,
+        data,
+        operation: 0,
+        safeTxGas: 0,
+        baseGas: 0,
+        gasPrice: 0,
+        gasToken: ethers.constants.AddressZero,
+        refundReceiver: ethers.constants.AddressZero,
+        nonce,
+    };
+
+    const signature = await ownerSigner._signTypedData(
+        { chainId, verifyingContract: safeAddress },
+        {
+            SafeTx: [
+                { name: 'to', type: 'address' },
+                { name: 'value', type: 'uint256' },
+                { name: 'data', type: 'bytes' },
+                { name: 'operation', type: 'uint8' },
+                { name: 'safeTxGas', type: 'uint256' },
+                { name: 'baseGas', type: 'uint256' },
+                { name: 'gasPrice', type: 'uint256' },
+                { name: 'gasToken', type: 'address' },
+                { name: 'refundReceiver', type: 'address' },
+                { name: 'nonce', type: 'uint256' },
+            ],
+        },
+        safeTx
+    );
+
+    const tx = await safeContract.execTransaction(
+        safeTx.to,
+        safeTx.value,
+        safeTx.data,
+        safeTx.operation,
+        safeTx.safeTxGas,
+        safeTx.baseGas,
+        safeTx.gasPrice,
+        safeTx.gasToken,
+        safeTx.refundReceiver,
+        signature
+    );
+
     await tx.wait();
 
     const sent = await provider.getTransaction(tx.hash);
